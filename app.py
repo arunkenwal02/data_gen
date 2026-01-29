@@ -18,6 +18,7 @@ from functools import reduce
 from operator import mul
 from dotenv import load_dotenv
 from os import environ as env
+import json
 load_dotenv()
 
 class RepoRequest(BaseModel):
@@ -27,14 +28,13 @@ class RepoRequest(BaseModel):
 class Main_file(BaseModel):
     columns: Dict[str, List[str]] = Field(
         description=(
-                    """Extract all input feature names that appear as keys in the application dictionary.
-                For each feature, generate one representative value per conditional branch that strictly satisfies the corresponding if/elif/else condition by using only the literal threshold values explicitly compared in the code and selecting values that fall inside the valid comparison range (for example, for dti < 0.2, generate a value strictly less than 0.2, not 0.2 itself).
+                    """You are given a single code which has all the functions required to compute the various scores, the input variables are specified in the metadata file along with their data types which are used in the downstream modules.
 
-                If a feature appears in conditional logic and has an else or implicit default branch,
-                include one representative value that satisfies the else condition (i.e., outside all preceding if/elif comparisons).
+                    Find the leaf nodes based on the various conditions applied on input variables in the code and for those leaf nodes find the values of input variables which satisfies the all conditional statements, 
+                    including default value to trivial 'else' statement, to reach that node, for each leaf node produce a single observation of input variables as key value pairs, if variable is not applicable for that node give any value possible.
 
-                If a feature is not used in any conditional comparison, return an empty list for it.
-                Do not infer values from example inputs, test data, or any other sources.
+                    
+
                 """
         )
     )
@@ -60,7 +60,6 @@ def create_dataset(request: RepoRequest):
 
 
     py_files = []
-    main_py_file = None
 
     urls_to_visit = [api_url]
 
@@ -81,25 +80,8 @@ def create_dataset(request: RepoRequest):
                 urls_to_visit.append(item["url"])
 
             elif item["type"] == "file" and name.endswith(".py"):
-                if name == "main.py":
-                    main_py_file = item["path"]
-                elif name != "__init__.py":
+                if name != "__init__.py":
                     py_files.append(item["path"])
-
-    loader = GithubFileLoader(
-            repo=repo,
-            branch="main",
-            file_path=main_py_file,
-            access_token=token,
-            file_filter=None  
-            )  
-    try:
-        doc = loader.load()
-        main_file_content = doc[0].page_content
-    except UnicodeDecodeError:
-        response = requests.get(f"https://api.github.com/repos/{repo}/contents/{main_py_file}", headers=headers)
-        content_encoded = response.json()["content"]
-        main_file_content = base64.b64decode(content_encoded).decode("utf-8", errors="ignore")
 
     py_file_contents = {}
     for file in py_files:
@@ -110,7 +92,7 @@ def create_dataset(request: RepoRequest):
             access_token=token,
             file_filter=None  
             )  
-        name = file.split('/')[-1][:-3] + "_content"
+        name = file.split('/')[-1][:-3]
         try:
             docs = loader.load()
             py_file_contents[name] = docs[0].page_content
@@ -121,7 +103,19 @@ def create_dataset(request: RepoRequest):
             content_encoded = response.json()["content"]
             content = base64.b64decode(content_encoded).decode("utf-8", errors="ignore")
             py_file_contents[name] = content
-    
+
+    whole_code = ""
+
+    with open('metadata.json', 'r') as file_handle:
+        meta_data = json.load(file_handle)
+
+    whole_code += '\n\n------------------------ ' + 'metadata' + ' file ------------------------\n\n'
+    whole_code += str(meta_data)
+
+    for key in py_file_contents.keys():
+        whole_code += '\n\n------------------------ ' + key + ' file ------------------------\n\n'
+        whole_code += py_file_contents[key]
+
     prompt = """
         You are given the contents of a Python source file.
 
@@ -139,62 +133,30 @@ def create_dataset(request: RepoRequest):
         validate_template=True
     )
     chain1 = temp | model | pydanticparser
-    main_result = chain1.invoke({'file_content':main_file_content})
-    data = dict(main_result)
-    allowed_keys = data['columns'].keys()
-    filtered_columns = {k: v for k, v in data['columns'].items() if v}
 
-    dict_result = []
+    result = chain1.invoke({"file_content": whole_code})
 
-    for file_name, file_content in py_file_contents.items():
-        result = chain1.invoke({"file_content": file_content})
-        dict_result.append(
-            result.model_dump()['columns']
-        )
+    file_path = "data.json"
 
-    filtered_list = [
-    {k: v for k, v in d.items() if k in allowed_keys and v} 
-    for d in dict_result
-    ]
-    filtered_list.append(filtered_columns)
-    merged_dict = {}
+    # Dump the dictionary to a JSON file
+    try:
+        with open(file_path, 'w') as json_file:
+            json.dump(result.model_dump()['columns'], json_file, indent=4) # Using indent for pretty-printing
+        print(f"Successfully dumped dictionary to {file_path}")
+    except IOError as e:
+        print(f"Error writing to file: {e}")
 
-    for d in filtered_list:
-        for key, values in d.items():
-            if key not in merged_dict:
-                merged_dict[key] = []
-            for v in values:
-                if v not in merged_dict[key]:
-                    merged_dict[key].append(v)
 
-    EXCEL_MAX_ROWS = 1_048_576
-    keys = list(merged_dict.keys())
-    values = [merged_dict[k] for k in keys]
-    total_rows = reduce(mul, (len(v) for v in values), 1)
+    data_observations = []
+    for key in result.model_dump()['columns'].keys():
+        observation = {}
+        for item in result.model_dump()['columns'][key]:
+            feature, val = item.split(':')
+            observation[feature] = val.strip()
+        if observation:
+            data_observations.append(observation)
 
-    print(f"Total combinations: {total_rows}")
-
-    if total_rows <= EXCEL_MAX_ROWS:
-        all_combinations = list(itertools.product(*values))
-        df = pd.DataFrame(all_combinations, columns=keys)
-        df.to_excel("data.xlsx", index=False)
-
-    else:
-        all_combinations = itertools.islice(
-            itertools.product(*values),
-            EXCEL_MAX_ROWS
-        )
-        df = pd.DataFrame(all_combinations, columns=keys)
-        df.to_excel("data.xlsx", index=False)
-
-    print(f"Rows written: {len(df)}")
-    return FileResponse(
-        path="data.xlsx",
-        filename="data.xlsx",
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-    
-
+    print(pd.DataFrame(data_observations)[list[meta_data.keys()]])
 
 
 
